@@ -1,0 +1,4 @@
+data/raw/
+outputs/
+*.rds
+.DS_Store
