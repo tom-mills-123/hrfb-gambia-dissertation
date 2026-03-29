@@ -36,7 +36,7 @@ To run the code, users must:
 2. Download the required DHS data files
 3. Update the local file path in `Stage_01_data_prep.r`
 
-DHS data are available from the DHS Program website.
+DHS data are available from the DHS Program website or from the GBoS website.
 
 ## Project structure
 
@@ -165,11 +165,12 @@ This repository is intended to document and organise the code used for the disse
 
 ## Author
 
-Tom
+Tom Mills
+24843946
 
 ## Dissertation title
 
-**High-risk fertility behaviour in The Gambia (DHS 2019–20)**
+**Determinants and Predictive Modelling of High-Risk Fertility Behaviour in The Gambia: Evidence from DHS Data**
 
 ## License
 
