@@ -133,7 +133,7 @@ clean_fp_exposure <- function(x) {
 # --------------------------
 
 # Set directory
-data_dir <- "/Users/tommills/Documents/MDataGov/Dissertation/Dissertation/Data/DHS Data/GM_2019-20_DHS_STATA"
+data_dir <- "SET_YOUR_OWN_DIR_HERE"
 
 # The DHS downloads can contain multiple files and subfolders, so the BR and IR
 # files are identified by pattern rather than by hard-coded filenames.
