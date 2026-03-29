@@ -4,40 +4,42 @@
 #
 # What this script does (and why):
 #   1) Load BR (births) and IR (women) DHS files
-#      - BR is the birth-level workhorse; IR contributes woman-level covariates and context.
 #   2) Clean variable names and keep only key design + analysis fields
-#      - reduces memory, speeds joins, and makes code readable.
-#   3) Enforce unit of analysis: births in the 5 years before interview (0–59 months)
-#      → improves temporal alignment of outcome and covariates, reduces recall bias.
+#   3) Restrict the analytic sample to births in the 5 years before interview
 #   4) Construct HRFB components per birth:
 #      - maternal age at birth <18 or >34
 #      - short interval (<24 months)
 #      - high parity (birth order ≥4)
-#   5) Create human-readable factors for core covariates and ordered FP message exposure.
+#   5) Create human-readable factors for core covariates
 #   6) Join selected IR covariates (v312 contraceptive use; v602 fertility preference).
 #   7) Create a PSU contextual aggregate: share of women with ≥ secondary education (v001).
-#   8) Build a survey design object (weights, PSU, strata) for design-based inference.
-#   9) Quick QA snapshots: missingness and sanity checks.
-#  10) Save analysis-ready objects (births df + survey design) as a checkpoint for later stages.
+#   8) Build a complex survey design object (weights, PSU, strata)
+#   9) Run basic QA checks
+#  10) Save cleaned objects as a checkpoint for later stages
 ############################################################
 
 # --------------------------
 # 0) Packages + global options
 # --------------------------
 
-# Set to TRUE only if you want the script to install missing packages automatically.
 AUTO_INSTALL <- FALSE
 
-# List of packages required for import, cleaning, plotting, and complex survey inference
+# Install required packages
 pkgs <- c(
-  "haven","dplyr","tidyr","stringr","labelled","survey","srvyr",
-  "janitor","forcats","ggplot2","purrr","Cairo"
+  "haven",
+  "dplyr",
+  "stringr",
+  "survey",
+  "srvyr",
+  "janitor",
+  "forcats",
+  "ggplot2"
 )
 
 # Identify which required packages are not installed
 missing_pkgs <- setdiff(pkgs, rownames(installed.packages()))
 
-# Install missing packages only if explicitly requested; otherwise stop with instructions
+# Install missing packages
 if (length(missing_pkgs) > 0) {
   if (isTRUE(AUTO_INSTALL)) {
     install.packages(missing_pkgs)
@@ -49,20 +51,16 @@ if (length(missing_pkgs) > 0) {
   }
 }
 
-# Load packages (suppress startup messages to keep logs readable)
+# Load packages - startup messages are surpressed to keep logs readable.
 suppressPackageStartupMessages({
   library(haven)
   library(dplyr)
-  library(tidyr)
   library(stringr)
-  library(labelled)
   library(survey)
   library(srvyr)
   library(janitor)
   library(forcats)
   library(ggplot2)
-  library(purrr)
-  library(Cairo)
 })
 
 # Configure variance estimation when a stratum contains only one PSU after subsetting
@@ -70,7 +68,7 @@ options(survey.lonely.psu = "adjust")
 
 
 # --------------------------
-# Plot style + export helpers
+# Helper functions
 # --------------------------
 
 # Define a consistent publication-ready plotting theme
@@ -92,7 +90,7 @@ theme_dissertation <- function(base_size = 11, base_family = "sans") {
     )
 }
 
-# Save figures in both PDF (vector) and PNG (high resolution)
+# Save figures in both PDF and PNG
 save_fig <- function(p, filename, fig_dir, w = 7, h = 4.5) {
   if (!dir.exists(fig_dir)) dir.create(fig_dir, recursive = TRUE)
   
@@ -107,75 +105,105 @@ save_fig <- function(p, filename, fig_dir, w = 7, h = 4.5) {
   )
 }
 
-# --------------------------
-# 1) Locate and import DHS data (BR & IR)
-#    Why: BR has birth histories; IR has woman-level covariates/context.
-# --------------------------
+# DHS exposure variables sometimes arrive with slightly inconsistent text
+# formatting in their labels. This helper standardises the labels before
+# converting them into an ordered factor, which makes the FP exposure
+# variables more robust to minor label differences.
+clean_fp_exposure <- function(x) {
+  x_clean <- x %>%
+    haven::as_factor() %>%
+    as.character() %>%
+    stringr::str_trim() %>%
+    stringr::str_to_lower()
+  
+  factor(
+    x_clean,
+    levels = c(
+      "not at all",
+      "less than once a week",
+      "at least once a week",
+      "almost every day"
+    ),
+    ordered = TRUE
+  )
+}
 
-
 # --------------------------
-# 1) Locate and import DHS data (BR & IR)
+# 1) Locate and import DHS data
 # --------------------------
 
 # Set directory
-data_dir <- "PATH_TO_YOUR_DHS_DATA"
+data_dir <- "/Users/tommills/Documents/MDataGov/Dissertation/Dissertation/Data/DHS Data/GM_2019-20_DHS_STATA"
 
-if (!dir.exists(data_dir)) {
-  stop("Please set `data_dir` to the local folder containing the DHS BR and IR .dta files.")
-}
+# The DHS downloads can contain multiple files and subfolders, so the BR and IR
+# files are identified by pattern rather than by hard-coded filenames.
+br_path <- list.files(
+  data_dir,
+  pattern = "(?i)BR.*\\.dta$",
+  full.names = TRUE,
+  recursive = TRUE
+)
 
-# Identify Births Recode (BR) and Individual Recode (IR) files
-br_path <- list.files(data_dir, pattern = "(?i)BR.*\\.dta$", full.names = TRUE, recursive = TRUE)
-ir_path <- list.files(data_dir, pattern = "(?i)IR.*\\.dta$", full.names = TRUE, recursive = TRUE)
+ir_path <- list.files(
+  data_dir,
+  pattern = "(?i)IR.*\\.dta$",
+  full.names = TRUE,
+  recursive = TRUE
+)
+
 if (length(br_path) == 0) stop("Births Recode (BR) .dta file not found.")
 if (length(ir_path) == 0) stop("Individual Recode (IR) .dta file not found.")
 if (length(br_path) > 1) warning("Multiple BR files found; using: ", br_path[1])
 if (length(ir_path) > 1) warning("Multiple IR files found; using: ", ir_path[1])
-br_path <- br_path[1]; ir_path <- ir_path[1]
 
-# Import and standardise variable names
+br_path <- br_path[1]
+ir_path <- ir_path[1]
+
+# Variable names are standardised immediately after import to make the rest
+# of the pipeline easier to read and less dependent on DHS naming format.
 br_raw <- read_dta(br_path) %>% clean_names()
 ir_raw <- read_dta(ir_path) %>% clean_names()
-message("BR dims: ", paste(dim(br_raw), collapse = " x"))
-message("IR dims: ", paste(dim(ir_raw), collapse = " x"))
+
+message("BR dims: ", paste(dim(br_raw), collapse = " x "))
+message("IR dims: ", paste(dim(ir_raw), collapse = " x "))
 
 # Output directories (used for figures + checkpoints)
 out_dir <- "outputs"
 fig_dir <- file.path(out_dir, "figs_stage1")
+
 if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
 if (!dir.exists(fig_dir)) dir.create(fig_dir, recursive = TRUE)
 
 
 # --------------------------
-# 2) Keep key variables & set initial design helpers
-#    Why: Trim to essentials; create weight/strata fields for later.
+# 2) Keep key variables and define design helpers
 # --------------------------
+
 # Start from the raw Births Recode data (already read and name-cleaned as `br_raw`)
 br <- br_raw %>%
   # Keep only the columns we need for design, core outcomes, and covariates
   select(
     caseid,                 # Case ID (unique within file; helps with tracking and QA)
     v001, v002, v003,       # IDs: v001 = cluster/PSU; v002 = household; v003 = respondent (woman)
-    
-    v021,                   # Survey design: Primary Sampling Unit (PSU) used by survey package
-    v022,                   # Survey design: Strata (preferred) — may be missing in some releases
+    v021,                   # Survey design: Primary Sampling Unit (PSU) 
+    v022,                   # Survey design: Strata 
     v023,                   # Survey design: Alternate strata variable (fallback if v022 is NA)
     v005,                   # Survey weight; stored as an integer that must be scaled by 1e6
     v011,                   # Woman's date of birth in CMC (Century Month Code)
-    v012,                   # Woman's age at interview in completed years (quick age check/QA)
-    v024,                   # Region (admin unit used for disaggregation/maps)
+    v012,                   # Woman's age at interview in completed years
+    v024,                   # Region 
     v025,                   # Place of residence (Urban/Rural)
     v106,                   # Highest education level attained
     v190,                   # Wealth quintile (1=poorest ... 5=richest)
-    v131,                   # Ethnicity (country-specific categories)
+    v131,                   # Ethnicity
     v157, v158, v159,       # Exposure to family planning messages: radio (v157), TV (v158), print (v159)
-    v008,                   # Interview date in CMC (used to compute fallback child age if b19 missing)
-    b3,                     # Child's date of birth in CMC (used for age-at-birth and age computations)
+    v008,                   # Interview date in CMC
+    b3,                     # Child's date of birth in CMC
     b11,                    # Preceding birth interval in months (used to flag short intervals <24)
     bord,                   # Birth order (1,2,3,...) — used to flag high parity (≥4)
     b19                     # Child's age in months at time of interview (used to restrict to last 5 years)
   ) %>%
-  # Create standardized design helpers used later by the survey design object
+  # Create standardised design helpers used later by the survey design object
   mutate(
     strata = coalesce(v022, v023),  # If v022 exists use it; otherwise use v023 as the strata variable
     weight = v005 / 1e6             # DHS weight must be divided by 1,000,000 to get the correct scale
@@ -185,11 +213,6 @@ br <- br_raw %>%
 
 # --------------------------
 # 3) Restrict births to the last 5 years
-#    Why: Align outcomes (e.g. birth timing, risk factors)
-#         with covariates measured at interview.
-#         DHS collects full birth histories, but we only
-#         keep births within 5 years to reduce recall bias
-#         and maintain temporal consistency.
 # --------------------------
 
 br <- br %>%
@@ -198,7 +221,7 @@ br <- br %>%
     # at the time of the mother's interview.
     #
     # - Some DHS BR files already contain b19 (age in months).
-    # - If b19 is missing (NA), we compute it manually using v008 (interview date)
+    # - If b19 is missing (NA), compute it manually using v008 (interview date)
     #   minus b3 (child's date of birth), both stored in Century Month Code (CMC).
     #   The result is age in months.
     #
@@ -213,20 +236,15 @@ br <- br %>%
   # - Exclude rows where 'child_age_months' is missing (NA),
   #   as those cases have insufficient timing data.
   # - Exclude births with child_age_months >= 60, i.e., older than 5 years.
-  #
-  # This ensures that all births analyzed are recent relative
-  # to the mother's interview and therefore comparable across covariates.
   filter(!is.na(child_age_months) & child_age_months < 60)
 
-# Print a message to the console showing how many rows remain
-# after the 5-year restriction (useful QA to confirm the subset size).
+# Print a message showing how many rows remain after the 5-year restriction 
+# (useful QA to confirm the subset size).
 message("Rows after 5-year restriction: ", nrow(br))
-
 # There are now 8362 rows after restriction
 
 # Double-check that the 5-year restriction worked by looking at the distribution 
 # of child ages in months
-
 br %>%
   summarise(
     min_age = min(child_age_months, na.rm = TRUE),
@@ -235,18 +253,30 @@ br %>%
   )
 
 
-# Visual QC: distribution of child ages (months) to confirm 0–59 restriction behaves as expected
+# Visual quality check: distribution of child ages (months) to confirm 0–59 restriction behaves as expected
 p_child_age_stage1 <- ggplot(br, aes(x = child_age_months)) +
-  geom_histogram(binwidth = 1, boundary = 0, closed = "left",
-                 color = "white", linewidth = 0.2) +
-  geom_vline(xintercept = seq(0, 59, by = 12), linetype = "dotted", linewidth = 0.3) +
-  scale_x_continuous(breaks = seq(0, 60, by = 6), limits = c(0, 59)) +
+  geom_histogram(
+    binwidth = 1,
+    boundary = 0,
+    closed = "left",
+    color = "white",
+    linewidth = 0.2
+  ) +
+  geom_vline(
+    xintercept = seq(0, 59, by = 12),
+    linetype = "dotted",
+    linewidth = 0.3
+  ) +
+  scale_x_continuous(
+    breaks = seq(0, 60, by = 6),
+    limits = c(0, 59)
+  ) +
   labs(
     title = "Child age in months (analytic 5-year window)",
-    subtitle = "Unweighted QC check of 0–59 month restriction (dotted lines at 12-month intervals)",
+    subtitle = "Unweighted QC check of the 0–59 month restriction",
     x = "Child age (months)",
     y = "Number of births",
-    caption = "Data: Gambia DHS 2019–20 BR file; ages use b19 with v008-b3 fallback if missing."
+    caption = "Data: Gambia DHS 2019–20 BR file; ages use b19 with v008-b3 fallback if needed."
   ) +
   theme_dissertation() +
   theme(axis.text.x = element_text(size = 9))
@@ -271,9 +301,11 @@ br %>%
 
 
 # --------------------------
-# 4) Maternal age at birth (years)
-#    Why: Defines age-based HRFB components.
+# 4) Maternal age at birth
 # --------------------------
+
+# Maternal age at birth is derived from the child’s and mother’s dates of birth,
+# both stored in Century Month Codes. This is one of the core HRFB components.
 br <- br %>%
   mutate(
     # Compute mother's age (in years) at the time of each birth.
@@ -286,13 +318,8 @@ br <- br %>%
     # v011 = mother's date of birth (CMC)
     #
     # Subtracting gives the mother's age in MONTHS at the child's birth.
-    # Dividing by 12 converts months → years.
+    # Dividing by 12 converts months to years.
     #
-    # Example:
-    #   If v011 = 1400 (born in April 2016) and b3 = 1700 (April 1941)
-    #   Real example: v011 = 1650 (born June 1987), b3 = 2100 (June 2012)
-    #   → 2100 - 1650 = 450 months = 37.5 years
-    # So age_at_birth = 37.5
     #
     # Result is a numeric variable (may include decimals).
     age_at_birth = (b3 - v011) / 12
@@ -300,15 +327,19 @@ br <- br %>%
 
 
 # --------------------------
-# 5) HRFB components & summaries
-#    Why: Construct the outcome variables used throughout the study.
+# 5) Construct HRFB components and summary outcomes
 # --------------------------
+
+# The HRFB indicators follow the DHS framework used in the dissertation:
+# maternal age <18, maternal age >34, preceding birth interval <24 months,
+# and birth order >=4. These are then combined into both a binary and a
+# multinomial summary outcome.
 br <- br %>%
   mutate(
     # 1) Young maternal age at birth:
     #    Flag births where mother's age at delivery was strictly < 18 years.
     #    - age_at_birth is continuous (from Step 4).
-    #    - Using 1L/0L stores integers (handy for modeling & memory).
+    #    - Using 1L/0L stores integers
     #    - missing = 0L ensures NA ages do not get flagged as "at risk" by accident.
     risk_age_young = if_else(age_at_birth < 18, 1L, 0L, missing = 0L),
     
@@ -349,7 +380,7 @@ br <- br %>%
   )
 
 # Check the variables behave as expected
-# Summarize proportions (unweighted preview)
+# Summarise proportions (unweighted preview)
 br %>%
   summarise(
     pct_young = mean(risk_age_young) * 100,
@@ -363,11 +394,10 @@ br %>%
 table(br$hrfb_multicat, useNA = "ifany")
 
 # --------------------------
-# 6) Human-readable covariates (labels → factors)
-#    Why: Easier QA/plots; FP as ordered to preserve frequency (dose-response).
+# 6) Create human-readable covariates
 # --------------------------
 
-# Define the desired order of FP exposure categories from lowest → highest frequency.
+# Define the desired order of FP exposure categories from lowest to highest frequency.
 # Using a fixed order ensures consistent plotting and interpretation across variables.
 fp_levels <- c("not at all", "less than once a week", "at least once a week", "almost every day")
 
@@ -438,14 +468,8 @@ br %>% count(ethnicity_raw, sort = TRUE) %>% print(n = 20)
 br %>% count(ethnicity,      sort = TRUE) %>% print(n = 20)
 
 
-
 # --------------------------
-# 7) Join extra IR variables & build contextual aggregate
-#    Why:
-#      1. Add woman-level variables from the IR file that aren't in BR
-#         (v312 = contraceptive use, v602 = fertility preference).
-#      2. Create a cluster-level (% with secondary education or higher)
-#         to capture contextual educational environment.
+# 7) Join selected IR variables and build a contextual aggregate
 # --------------------------
 
 # 7a) --- Bring selected IR covariates ---
@@ -454,17 +478,27 @@ ir_small <- ir_raw %>%
     v001, v002, v003,  # Keys: cluster, household, respondent (to join on)
     v312,              # Current contraceptive method
     v602,              # Fertility preference ("wants more children", etc.)
-    v106               # Education level (kept for cluster-level aggregate)
   ) %>%
-  distinct()            # Ensure one row per woman (avoid duplicates)
+  distinct(v001, v002, v003, .keep_all = TRUE)  # Ensure one row per woman (avoid duplicates)
+
+# A uniqueness check on the join keys is included here because the birth-level
+# file will inherit these woman-level characteristics after the join.
+ir_key_check <- ir_small %>%
+  count(v001, v002, v003) %>%
+  summarise(max_n = max(n)) %>%
+  pull(max_n)
+
+if (ir_key_check != 1) {
+  stop("IR join keys are not unique after reduction. Check `ir_small` before proceeding.")
+}
 
 # Join these IR variables to the BR dataset.
 # Each birth will inherit its mother's contraceptive and fertility preference info.
 df <- br %>%
   left_join(ir_small, by = c("v001", "v002", "v003")) %>%
   mutate(
-    # >>> ADDED: stable unique identifier for each woman <<<
-    # Why: used later for within-woman sensitivity analysis (one birth per woman).
+    # ADDED: stable unique identifier for each woman
+    # Used later for within-woman sensitivity analysis (one birth per woman).
     woman_id = paste(v001, v002, v003, sep = "_"),
     
     # Convert DHS coded variables into labelled factors.
@@ -528,24 +562,12 @@ print(p_share_sec_plus)
 save_fig(p_share_sec_plus, "stage1_psu_share_sec_plus_distribution", fig_dir = fig_dir)
 
 
-
-
 # ---------------------------------------------------------
-# STEP 8 — Build the survey design object (DHS complex design)
-#
-# Purpose:
-#   Turn the flat data frame `df` into a design-aware object that
-#   encodes DHS sampling features (weights, PSUs, strata). This is
-#   required for correct weighted estimates, standard errors, and CIs.
-#
-# Inputs expected in `df`:
-#   - weight : numeric = v005 / 1e6 (scaled DHS sampling weight)
-#   - v021   : integer PSU/cluster identifier
-#   - strata : stratification variable (coalesce(v022, v023))
-#
-# Output:
-#   - design_srvyr : an srvyr survey design object
+# 8) Build the survey design object
 # ---------------------------------------------------------
+
+# The survey design object stores the DHS sampling structure needed for
+# design-based estimation in later descriptive and regression analyses.
 
 # 1) Safety check — ensure required variables exist before building the design
 stopifnot(all(c("weight", "strata", "v021") %in% names(df)))
@@ -570,7 +592,7 @@ design_srvyr <- srvyr::as_survey_design(
 
 # 4) QA Checks
 
-# How many observations, PSUs, and strata made it into the design?
+# How many observations, PSUs, and strata made it into the design.
 df_design %>%
   dplyr::summarise(
     n_rows   = dplyr::n(),
@@ -583,30 +605,18 @@ df_design %>%
   print()
 
 # Smoke test: compute a weighted prevalence with a 95% CI
-# (Replace `hrfb_binary` with any 0/1 variable you’ve created.)
+# (Replace `hrfb_binary` with any 0/1 variable)
 design_srvyr %>%
   srvyr::summarise(hrfb_prev = survey_mean(hrfb_binary, vartype = "ci", na.rm = TRUE)) %>%
   print()
 
 
 # ---------------------------------------------------------
-# STEP 9 — Core QA snapshots
-#
-# Purpose:
-#   1) Verify completeness of key variables used to define outcomes
-#      and the survey design (weights, PSU, strata).
-#   2) Do a quick design-adjusted prevalence check for HRFB to confirm
-#      the survey design object behaves as expected.
-#
-# Assumes:
-#   - `df` exists (your cleaned birth-level dataset after Steps 1–8).
-#   - `design_srvyr` exists (survey design object built in Step 8).
-#
-# Outputs:
-#   - A tibble `qa_missing` with missing-value counts.
-#   - A printed weighted prevalence of HRFB (with 95% CI).
-#   - Optional sanity checks to confirm b11 missingness matches first births.
+# Core QA snapshots
 # ---------------------------------------------------------
+
+# This final QA block provides a compact summary of missingness and a few
+# simple diagnostic checks before the cleaned objects are saved.
 
 # 1) Snapshot of missingness in critical fields
 qa_missing <- df %>%
@@ -663,24 +673,17 @@ df %>%
 
 # ---------------------------------------------------------
 # STEP 10 — Save analysis-ready objects (checkpoint)
-#
-# Purpose:
-#   Persist the cleaned births dataset (`df`) and the survey design
-#   object (`design_srvyr`) so downstream scripts can start from here
-#   without re-running Steps 1–9. Also write a small README describing
-#   what's inside and key assumptions.
 # ---------------------------------------------------------
 
-
-# 2) Construct clear, versionable file paths for the checkpoint objects
+# Construct clear, versionable file paths for the checkpoint objects
 births_path <- file.path(out_dir, "step01_births_clean.rds")      # cleaned birth-level dataframe
 design_path <- file.path(out_dir, "step01_svy_design.rds")        # srvyr survey design object
 
-# 3) Save the R objects as .rds 
+# Save the R objects as .rds 
 saveRDS(df,           births_path)                     # write the cleaned births dataset (5-year window)
 saveRDS(design_srvyr, design_path)                     # write the survey design (weights/PSU/strata)
 
-# 4) Write a README file
+# Write a README file
 readme_path <- file.path(out_dir, "README_step1_checkpoint.txt")  
 readme_txt <- c(
   "STEP 1 CHECKPOINT",
